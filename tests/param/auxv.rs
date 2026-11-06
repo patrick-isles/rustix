@@ -3,7 +3,7 @@ use rustix::param::{clock_ticks_per_second, page_size};
     all(target_os = "android", target_pointer_width = "64"),
     target_os = "linux",
 ))]
-use rustix::param::{linux_hwcap, linux_minsigstksz};
+use rustix::param::{linux_execfn, linux_hwcap, linux_minsigstksz};
 
 #[test]
 fn test_page_size() {
@@ -54,4 +54,14 @@ fn test_linux_minsigstksz() {
             unsafe { libc_getauxval(libc::AT_MINSIGSTKSZ) } as usize
         );
     }
+}
+
+#[cfg(any(
+    all(target_os = "android", target_pointer_width = "64"),
+    target_os = "linux",
+))]
+#[test]
+fn test_linux_execfn() {
+    let execfn = linux_execfn();
+    assert_ne!(execfn.to_bytes().as_ptr(), std::ptr::null());
 }

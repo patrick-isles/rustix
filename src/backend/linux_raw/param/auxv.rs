@@ -5,7 +5,9 @@
 //! This uses raw pointers to locate and read the kernel-provided auxv array.
 #![allow(unsafe_code)]
 
-use super::super::conv::{c_int, pass_usize, ret_usize};
+#[cfg(target_pointer_width = "64")]
+use super::super::conv::loff_t_from_u64;
+use super::super::conv::{c_int, c_uint, no_fd, pass_usize, ret, ret_usize, ret_void_star};
 use crate::backend::c;
 use crate::fd::OwnedFd;
 #[cfg(feature = "param")]
@@ -14,6 +16,7 @@ use crate::fs::{Mode, OFlags};
 use crate::utils::{as_ptr, check_raw_pointer};
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::{null_mut, read_unaligned, NonNull};
 #[cfg(feature = "runtime")]
@@ -95,8 +98,14 @@ pub(crate) fn linux_execfn() -> &'static CStr {
         execfn = EXECFN.load(Relaxed);
     }
 
+    if execfn.is_null() {
+        static EMPTY_CSTR: &[u8] = b"\0";
+        execfn = EMPTY_CSTR.as_ptr() as *mut c::c_char;
+        EXECFN.store(execfn, Relaxed);
+    }
+
     // SAFETY: We assume the `AT_EXECFN` value provided by the kernel is a
-    // valid pointer to a valid NUL-terminated array of bytes.
+    // valid pointer to a valid NUL-terminated array of bytes, or our static fallback.
     unsafe { CStr::from_ptr(execfn.cast()) }
 }
 
@@ -262,11 +271,16 @@ fn pr_get_auxv_dynamic(buffer: &mut [u8; 512]) -> crate::io::Result<Cow<'_, [u8]
     Ok(Cow::Owned(buffer))
 }
 
-/// Read the auxv records and initialize the various static variables. Panic
-/// if an error is encountered.
+/// Read the auxv records and initialize the various static variables.
+///
+/// If auxv is unavailable (for example, on Linux kernels < 6.4 where `PR_GET_AUXV`
+/// is unsupported and `/proc/self/auxv` cannot be opened due to security capabilities,
+/// `AT_SECURE`, or container isolation), fallback values are initialized so callers
+/// do not panic.
 #[cold]
 fn init_auxv() {
-    init_auxv_impl().unwrap();
+    let _ = init_auxv_impl();
+    init_auxv_fallback();
 }
 
 /// Like `init_auxv`, but don't panic if an error is encountered. The caller
@@ -274,6 +288,118 @@ fn init_auxv() {
 #[cold]
 fn maybe_init_auxv() {
     let _ = init_auxv_impl();
+}
+
+/// Fallback initialization for when auxv records cannot be read from the kernel or procfs.
+#[cold]
+fn init_auxv_fallback() {
+    if PAGE_SIZE.load(Relaxed) == 0 {
+        PAGE_SIZE.store(probe_page_size(), Relaxed);
+    }
+
+    if CLOCK_TICKS_PER_SECOND.load(Relaxed) == 0 {
+        // Standard Linux USER_HZ default is 100.
+        CLOCK_TICKS_PER_SECOND.store(100, Relaxed);
+    }
+
+    if MINSIGSTKSZ.load(Relaxed) == 0 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let min_sig = 2048;
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let min_sig = 4096;
+        MINSIGSTKSZ.store(min_sig, Relaxed);
+    }
+
+    #[cfg(feature = "runtime")]
+    if SECURE.load(Relaxed) == 0 {
+        // When /proc/self/auxv cannot be opened due to permission denied (EACCES),
+        // the process has been placed into secure execution mode (e.g. via setcap).
+        SECURE.store(2, Relaxed);
+    }
+}
+
+/// Determine the system page size when auxv is unavailable.
+#[cold]
+pub(crate) fn probe_page_size() -> usize {
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "s390x",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    ))]
+    {
+        4096
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "s390x",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
+    {
+        probe_page_size_dynamic()
+    }
+}
+
+/// Dynamically probe page size on architectures with variable page sizes (e.g. aarch64, powerpc)
+/// via anonymous mmap and mprotect alignment testing.
+#[allow(dead_code)]
+#[cold]
+pub(crate) fn probe_page_size_dynamic() -> usize {
+    const MAX_PAGE_SIZE: usize = 65536;
+    const MAP_PRIVATE: c::c_uint = 0x02;
+    const MAP_ANONYMOUS: c::c_uint = 0x20;
+    const PROT_NONE: c::c_int = 0;
+
+    unsafe {
+        #[cfg(target_pointer_width = "32")]
+        let map_res = ret_void_star(syscall!(
+            __NR_mmap2,
+            null_mut::<c_void>(),
+            pass_usize(MAX_PAGE_SIZE),
+            c_int(PROT_NONE),
+            c_uint(MAP_PRIVATE | MAP_ANONYMOUS),
+            no_fd(),
+            pass_usize(0)
+        ));
+
+        #[cfg(target_pointer_width = "64")]
+        let map_res = ret_void_star(syscall!(
+            __NR_mmap,
+            null_mut::<c_void>(),
+            pass_usize(MAX_PAGE_SIZE),
+            c_int(PROT_NONE),
+            c_uint(MAP_PRIVATE | MAP_ANONYMOUS),
+            no_fd(),
+            loff_t_from_u64(0)
+        ));
+
+        if let Ok(addr) = map_res {
+            let mut detected_page_size = MAX_PAGE_SIZE;
+            for &candidate in &[4096, 16384, 65536] {
+                let test_ptr = (addr as usize + candidate) as *mut c_void;
+                let res = ret(syscall!(
+                    __NR_mprotect,
+                    test_ptr,
+                    pass_usize(candidate),
+                    c_int(PROT_NONE)
+                ));
+                if res.is_ok() {
+                    detected_page_size = candidate;
+                    break;
+                }
+            }
+            let _ = ret(syscall!(__NR_munmap, addr, pass_usize(MAX_PAGE_SIZE)));
+            return detected_page_size;
+        }
+    }
+
+    4096
 }
 
 /// If we don't have "use-explicitly-provided-auxv" or "use-libc-auxv", we
@@ -298,9 +424,10 @@ fn init_auxv_impl() -> Result<(), ()> {
     if let Ok(buffer) = result {
         // SAFETY: We assume the kernel returns a valid auxv.
         unsafe {
-            init_from_aux_iter(AuxPointer(buffer.as_ptr().cast())).unwrap();
+            if init_from_aux_iter(AuxPointer(buffer.as_ptr().cast())).is_some() {
+                return Ok(());
+            }
         }
-        return Ok(());
     }
 
     // If `PR_GET_AUXV` is unavailable, or if we don't have "alloc" and
@@ -309,14 +436,16 @@ fn init_auxv_impl() -> Result<(), ()> {
     // checking breaks on QEMU.
     if let Ok(file) = crate::fs::open("/proc/self/auxv", OFlags::RDONLY, Mode::empty()) {
         #[cfg(feature = "alloc")]
-        init_from_auxv_file(file).unwrap();
+        if init_from_auxv_file(file).is_some() {
+            return Ok(());
+        }
 
         #[cfg(not(feature = "alloc"))]
         unsafe {
-            init_from_aux_iter(AuxFile(file)).unwrap();
+            if init_from_aux_iter(AuxFile(file)).is_some() {
+                return Ok(());
+            }
         }
-
-        return Ok(());
     }
 
     Err(())
@@ -399,7 +528,11 @@ unsafe fn init_from_aux_iter(aux_iter: impl Iterator<Item = Elf_auxv_t>) -> Opti
             AT_HWCAP => hwcap = a_val as usize,
             AT_HWCAP2 => hwcap2 = a_val as usize,
             AT_MINSIGSTKSZ => minsigstksz = a_val as usize,
-            AT_EXECFN => execfn = check_raw_pointer::<c::c_char>(a_val as *mut _)?.as_ptr(),
+            AT_EXECFN => {
+                if let Some(ptr) = check_raw_pointer::<c::c_char>(a_val as *mut _) {
+                    execfn = ptr.as_ptr();
+                }
+            }
 
             // Use the `AT_SYSINFO_EHDR` if it matches the platform rustix is
             // compiled for.
@@ -420,7 +553,11 @@ unsafe fn init_from_aux_iter(aux_iter: impl Iterator<Item = Elf_auxv_t>) -> Opti
             #[cfg(feature = "runtime")]
             AT_EGID => egid = Some(a_val),
             #[cfg(feature = "runtime")]
-            AT_PHDR => phdr = check_raw_pointer::<Elf_Phdr>(a_val as *mut _)?.as_ptr(),
+            AT_PHDR => {
+                if let Some(ptr) = check_raw_pointer::<Elf_Phdr>(a_val as *mut _) {
+                    phdr = ptr.as_ptr();
+                }
+            }
             #[cfg(feature = "runtime")]
             AT_PHNUM => phnum = a_val as usize,
             #[cfg(feature = "runtime")]
@@ -428,7 +565,11 @@ unsafe fn init_from_aux_iter(aux_iter: impl Iterator<Item = Elf_auxv_t>) -> Opti
             #[cfg(feature = "runtime")]
             AT_ENTRY => entry = a_val as usize,
             #[cfg(feature = "runtime")]
-            AT_RANDOM => random = check_raw_pointer::<[u8; 16]>(a_val as *mut _)?.as_ptr(),
+            AT_RANDOM => {
+                if let Some(ptr) = check_raw_pointer::<[u8; 16]>(a_val as *mut _) {
+                    random = ptr.as_ptr();
+                }
+            }
 
             AT_NULL => break,
             _ => (),
@@ -436,7 +577,9 @@ unsafe fn init_from_aux_iter(aux_iter: impl Iterator<Item = Elf_auxv_t>) -> Opti
     }
 
     #[cfg(feature = "runtime")]
-    assert_eq!(phent, size_of::<Elf_Phdr>());
+    if phent != 0 {
+        assert_eq!(phent, size_of::<Elf_Phdr>());
+    }
 
     // If we're running set-uid or set-gid, enable “secure execution” mode,
     // which doesn't do much, but users may be depending on the things that
@@ -576,5 +719,25 @@ impl Iterator for AuxFile {
             }
         }
         Some(unsafe { read_unaligned(buf.as_ptr().cast()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dynamic_page_size_probe() {
+        let size = probe_page_size_dynamic();
+        assert!(size == 4096 || size == 16384 || size == 65536);
+        assert!(size.is_power_of_two());
+    }
+
+    #[test]
+    fn test_fallback_initialization() {
+        init_auxv_fallback();
+        assert_ne!(PAGE_SIZE.load(Relaxed), 0);
+        assert_ne!(CLOCK_TICKS_PER_SECOND.load(Relaxed), 0);
+        assert_ne!(MINSIGSTKSZ.load(Relaxed), 0);
     }
 }
